@@ -39,64 +39,62 @@ type DefaultInfo struct {
 	Extra  map[string][]string
 }
 
+func ValidateCert(cert []byte, validator string) (*DefaultInfo, error) {
+	b := &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: cert,
+	}
+
+	buf := bytes.Buffer{}
+	if err := pem.Encode(&buf, b); err != nil {
+		return nil, err
+	}
+
+	// use stdin instead?
+	cmd := exec.Command(validator, buf.String()+"\n")
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	err := cmd.Run()
+	if err != nil {
+		return nil, err
+	}
+
+	info := &DefaultInfo{}
+	err = json.Unmarshal(out.Bytes(), &info)
+	if err != nil {
+		return nil, err
+	}
+
+	return info, nil
+}
+
 func (p *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	func() {
-		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-			return
+	if r.TLS != nil && len(r.TLS.PeerCertificates) != 0 {
+		info, err := ValidateCert(r.TLS.PeerCertificates[0].Raw, p.validator)
+		if err == nil {
+			r.Header.Set("X-Remote-User", info.Name)
+			for _, group := range info.Groups {
+				r.Header.Add("X-Remote-Group", group)
+			}
 		}
-		b := &pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: r.TLS.PeerCertificates[0].Raw,
-		}
-		buf := bytes.Buffer{}
-		if err := pem.Encode(&buf, b); err != nil {
-			return
-		}
-		cmd := exec.Command(p.validator, buf.String())
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		err := cmd.Run()
-		if err != nil {
-			return
-		}
-		// out should be a json of user,group,extra
-		var info DefaultInfo
-		err = json.Unmarshal(out.Bytes(), &info)
-		if err != nil {
-			return
-		}
-		r.Header.Set("X-Remote-User", info.Name)
-		for _, group := range info.Groups {
-			r.Header.Add("X-Remote-Group", group)
-		}
-	}()
+	}
 	p.handler.ServeHTTP(w, r)
 }
 
-func main() {
-	// parse flags
-	// --listen-addr=
-	// * --backend-addr=
-	// * --backend-ca=
-	// * --server-cert=
-	// * --server-key=
-	// * --server-CA=
-	// * --validator-script=
-	//
-	listenAddr := flag.String("listen-addr", ":4181", "<addr>:<port> to listen on for HTTPS clients")
-	backendAddr := flag.String("backend-addr", "", "the https url of the backend")
-	backendCA := flag.String("backend-ca", "", "the file path to the backend CA bundle")
-	serverCert := flag.String("server-cert", "", "the file path to the server certificate")
-	serverKey := flag.String("server-key", "", "the file path to the server key")
-	serverCA := flag.String("server-ca", "", "the file path to the server CA")
-	validatorScript := flag.String("validator-script", "", "the file path to the certificate validation script")
-	flag.Parse()
+type Options struct {
+	listenAddr      string
+	backendAddr     string
+	backendCA       string
+	serverCert      string
+	serverKey       string
+	serverCA        string
+	validatorScript string
+}
 
-	if *listenAddr == "" || *backendAddr == "" || *backendCA == "" || *serverCert == "" || *serverKey == "" || *validatorScript == "" {
-		flag.PrintDefaults()
-		os.Exit(1)
-	}
-	backendUrl, err := url.Parse(*backendAddr)
+func RunCertProxy(opts *Options) {
+	backendUrl, err := url.Parse(opts.backendAddr)
 	if err != nil {
 		log.Fatalf("error parsing backend URL %s", err)
 	}
@@ -109,7 +107,7 @@ func main() {
 		IdleConnTimeout:     1 * time.Minute,
 	}
 
-	caFile, err := ioutil.ReadFile(*backendCA)
+	caFile, err := ioutil.ReadFile(opts.backendCA)
 	if err != nil {
 		log.Fatalf("error reading CA file %s", err)
 	}
@@ -129,7 +127,7 @@ func main() {
 	}
 
 	proxy.Transport = transport
-	proxyHandler := &proxyHandler{proxy, *validatorScript}
+	proxyHandler := &proxyHandler{proxy, opts.validatorScript}
 
 	config := &tls.Config{
 		MinVersion: tls.VersionTLS12,
@@ -140,15 +138,15 @@ func main() {
 	}
 
 	config.Certificates = make([]tls.Certificate, 1)
-	config.Certificates[0], err = tls.LoadX509KeyPair(*serverCert, *serverKey)
+	config.Certificates[0], err = tls.LoadX509KeyPair(opts.serverCert, opts.serverKey)
 	if err != nil {
-		log.Fatalf("FATAL: loading tls config (%s, %s) failed - %s", *serverCert, *serverKey, err)
+		log.Fatalf("FATAL: loading tls config (%s, %s) failed - %s", opts.serverCert, opts.serverKey, err)
 	}
 
-	if len(*serverCA) > 0 {
+	if len(opts.serverCA) > 0 {
 		config.ClientAuth = tls.RequestClientCert
 		p := x509.NewCertPool()
-		serverCAFile, err := ioutil.ReadFile(*serverCA)
+		serverCAFile, err := ioutil.ReadFile(opts.serverCA)
 		if err != nil {
 			log.Fatalf("error reading CA file %s", err)
 		}
@@ -161,19 +159,46 @@ func main() {
 		}
 	}
 
-	ln, err := net.Listen("tcp", *listenAddr)
+	ln, err := net.Listen("tcp", opts.listenAddr)
 	if err != nil {
-		log.Fatalf("FATAL: listen (%s) failed - %s", *listenAddr, err)
+		log.Fatalf("FATAL: listen (%s) failed - %s", opts.listenAddr, err)
 	}
 	log.Printf("HTTPS: listening on %s", ln.Addr())
-
 	tlsListener := tls.NewListener(tcpKeepAliveListener{ln.(*net.TCPListener)}, config)
+
 	srv := &http.Server{Handler: proxyHandler}
 	err = srv.Serve(tlsListener)
 
 	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
 		log.Printf("ERROR: https.Serve() - %s", err)
 	}
+}
+
+func main() {
+	listenAddr := flag.String("listen-addr", ":4181", "<addr>:<port> to listen on for HTTPS clients")
+	backendAddr := flag.String("backend-addr", "", "the https url of the backend")
+	backendCA := flag.String("backend-ca", "", "the file path to the backend CA bundle")
+	serverCert := flag.String("server-cert", "", "the file path to the server certificate")
+	serverKey := flag.String("server-key", "", "the file path to the server key")
+	serverCA := flag.String("server-ca", "", "the file path to the server CA")
+	validatorScript := flag.String("validator-script", "", "the file path to the certificate validation script")
+	flag.Parse()
+
+	if *listenAddr == "" || *backendAddr == "" || *backendCA == "" || *serverCert == "" || *serverKey == "" || *validatorScript == "" {
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	opts := &Options{
+		listenAddr:      *listenAddr,
+		backendAddr:     *backendAddr,
+		backendCA:       *backendCA,
+		serverCert:      *serverCert,
+		serverKey:       *serverKey,
+		serverCA:        *serverCA,
+		validatorScript: *validatorScript,
+	}
+	RunCertProxy(opts)
 }
 
 // tcpKeepAliveListener sets TCP keep-alive timeouts on accepted
