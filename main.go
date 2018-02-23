@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
@@ -23,23 +24,24 @@ import (
 )
 
 // handler reads the TLS peer cert and passes it to a validator script
-// on return expects a json formatted DefaultInfo, and adds it to the headers
+// on return expects a json formatted UserInfo, and adds it to the headers
 // X-Remote-User, X-Remote-Group, X-Remote-Extra-
 type proxyHandler struct {
-	handler   http.Handler
-	validator string
+	userHeader  string
+	groupHeader string
+	extraHeader string
+	handler     http.Handler
+	validator   string
 }
 
-// DefaultInfo provides a simple user information exchange object
-// for components that implement the UserInfo interface.
-type DefaultInfo struct {
+type UserInfo struct {
 	Name   string
 	UID    string
 	Groups []string
 	Extra  map[string][]string
 }
 
-func ValidateCert(cert []byte, validator string) (*DefaultInfo, error) {
+func ValidateCert(cert []byte, validator string) (*UserInfo, error) {
 	b := &pem.Block{
 		Type:  "CERTIFICATE",
 		Bytes: cert,
@@ -61,7 +63,7 @@ func ValidateCert(cert []byte, validator string) (*DefaultInfo, error) {
 		return nil, err
 	}
 
-	info := &DefaultInfo{}
+	info := &UserInfo{}
 	err = json.Unmarshal(out.Bytes(), &info)
 	if err != nil {
 		return nil, err
@@ -74,26 +76,90 @@ func (p *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.TLS != nil && len(r.TLS.PeerCertificates) != 0 {
 		info, err := ValidateCert(r.TLS.PeerCertificates[0].Raw, p.validator)
 		if err == nil {
-			r.Header.Set("X-Remote-User", info.Name)
+			r.Header.Set(p.userHeader, info.Name)
 			for _, group := range info.Groups {
-				r.Header.Add("X-Remote-Group", group)
+				r.Header.Add(p.groupHeader, group)
 			}
 		}
 	}
 	p.handler.ServeHTTP(w, r)
 }
 
-type Options struct {
-	listenAddr      string
-	backendAddr     string
-	backendCA       string
-	serverCert      string
-	serverKey       string
-	serverCA        string
-	validatorScript string
+type CertProxyMapper interface {
+	Verify(cert []byte) (*UserInfo, bool, error)
 }
 
-func RunCertProxy(opts *Options) {
+type FileCertProxyMapper struct {
+	path string
+}
+
+func (v *FileCertProxyMapper) Verify(cert []byte) (*UserInfo, bool, error) {
+	return nil, true, nil
+}
+
+type SANCertProxyMapper struct {
+	userPrefix  string
+	groupPrefix string
+	extraPrefix string
+}
+
+func (v *SANCertProxyMapper) Verify(cert []byte) (*UserInfo, bool, error) {
+	return nil, true, nil
+}
+
+type ScriptCertProxyMapper struct {
+	path string
+}
+
+func (v *ScriptCertProxyMapper) Verify(cert []byte) (*UserInfo, bool, error) {
+	return nil, true, nil
+}
+
+type CertProxyOptions struct {
+	listenAddr        string
+	backendAddr       string
+	backendCA         string
+	backendClientCert string
+	backendClientKey  string
+	proxyServingCert  string
+	proxyServingKey   string
+	proxyServingCA    string
+	userHeader        string
+	groupHeader       string
+	extraHeader       string
+	validatorScript   string
+	fileMapPath       string
+	scriptMapPath     string
+	sanMapEnable      bool
+	mappers           []CertProxyMapper
+}
+
+func (o *CertProxyOptions) ValidateOptions() error {
+	if len(o.backendAddr) == 0 {
+		return fmt.Errorf("backend-addr must be provided")
+	}
+	if len(o.backendCA) == 0 {
+		return fmt.Errorf("backend-ca must be provided")
+	}
+	if len(o.backendClientCert) == 0 {
+		return fmt.Errorf("backend-cert must be provided")
+	}
+	if len(o.backendClientKey) == 0 {
+		return fmt.Errorf("backend-key must be provided")
+	}
+	if len(o.proxyServingCA) == 0 {
+		return fmt.Errorf("server-ca must be provided")
+	}
+	if len(o.proxyServingCert) == 0 {
+		return fmt.Errorf("server-cert must be provided")
+	}
+	if len(o.proxyServingKey) == 0 {
+		return fmt.Errorf("server-key must be provided")
+	}
+	return nil
+}
+
+func RunCertProxy(opts *CertProxyOptions) {
 	backendUrl, err := url.Parse(opts.backendAddr)
 	if err != nil {
 		log.Fatalf("error parsing backend URL %s", err)
@@ -117,9 +183,17 @@ func RunCertProxy(opts *Options) {
 		log.Fatalf("error loading CA %s", err)
 	}
 
-	transport.TLSClientConfig = &tls.Config{
-		RootCAs: pool,
+	// load client cert and key for mutual TLS (front proxy CA - front proxy issued cert)
+	backendCert, err := tls.LoadX509KeyPair(opts.backendClientCert, opts.backendClientKey)
+	if err != nil {
+		log.Fatalf("error loading backend cert/key", err)
 	}
+
+	transport.TLSClientConfig = &tls.Config{
+		RootCAs:      pool,
+		Certificates: []tls.Certificate{backendCert},
+	}
+	transport.TLSClientConfig.BuildNameToCertificate()
 
 	// is this needed?
 	if err := http2.ConfigureTransport(transport); err != nil {
@@ -127,37 +201,42 @@ func RunCertProxy(opts *Options) {
 	}
 
 	proxy.Transport = transport
-	proxyHandler := &proxyHandler{proxy, opts.validatorScript}
+	proxyHandler := &proxyHandler{
+		userHeader:  opts.userHeader,
+		groupHeader: opts.groupHeader,
+		extraHeader: opts.extraHeader,
+		handler:     proxy,
+		validator:   opts.validatorScript,
+	}
+
+	// proxy server setup
+	servingCert, err := tls.LoadX509KeyPair(opts.proxyServingCert, opts.proxyServingKey)
+	if err != nil {
+		log.Fatalf("FATAL: loading tls config (%s, %s) failed - %s", opts.proxyServingCert, opts.proxyServingKey, err)
+	}
+
+	var serverPool *x509.CertPool
+	if len(opts.proxyServingCA) > 0 {
+		pool = x509.NewCertPool()
+		serverCAFile, err := ioutil.ReadFile(opts.proxyServingCA)
+		if err != nil {
+			log.Fatalf("error reading CA file %s", err)
+		}
+		if !pool.AppendCertsFromPEM(serverCAFile) {
+			log.Fatalf("error loading CA file %s", err)
+		}
+	}
 
 	config := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		MaxVersion: tls.VersionTLS12,
+		MinVersion:   tls.VersionTLS12,
+		MaxVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{servingCert},
+		ClientCAs:    serverPool,
 	}
 	if config.NextProtos == nil {
 		config.NextProtos = []string{"http/1.1"}
 	}
-
-	config.Certificates = make([]tls.Certificate, 1)
-	config.Certificates[0], err = tls.LoadX509KeyPair(opts.serverCert, opts.serverKey)
-	if err != nil {
-		log.Fatalf("FATAL: loading tls config (%s, %s) failed - %s", opts.serverCert, opts.serverKey, err)
-	}
-
-	if len(opts.serverCA) > 0 {
-		config.ClientAuth = tls.RequestClientCert
-		p := x509.NewCertPool()
-		serverCAFile, err := ioutil.ReadFile(opts.serverCA)
-		if err != nil {
-			log.Fatalf("error reading CA file %s", err)
-		}
-		if !p.AppendCertsFromPEM(serverCAFile) {
-			log.Fatalf("error loading CA file %s", err)
-		}
-		config.ClientCAs = p
-		if err != nil {
-			log.Fatalf("FATAL: %s", err)
-		}
-	}
+	config.BuildNameToCertificate()
 
 	ln, err := net.Listen("tcp", opts.listenAddr)
 	if err != nil {
@@ -174,30 +253,81 @@ func RunCertProxy(opts *Options) {
 	}
 }
 
+func (o *CertProxyOptions) SetMappers() error {
+	var mappers []CertProxyMapper
+	if o.sanMapEnable {
+		sanMap := &SANCertProxyMapper{
+			userPrefix:  "user",
+			groupPrefix: "group",
+			extraPrefix: "extra",
+		}
+		mappers = append(mappers, sanMap)
+	}
+	if len(o.fileMapPath) > 0 {
+		fileMap := &FileCertProxyMapper{
+			path: o.fileMapPath,
+		}
+		mappers = append(mappers, fileMap)
+	}
+	if len(o.scriptMapPath) > 0 {
+		scriptMap := &ScriptCertProxyMapper{
+			path: o.scriptMapPath,
+		}
+		mappers = append(mappers, scriptMap)
+	}
+	if len(mappers) < 1 {
+		return fmt.Errorf("at least one cert mapper is required")
+	}
+	o.mappers = mappers
+
+	return nil
+}
+
 func main() {
 	listenAddr := flag.String("listen-addr", ":4181", "<addr>:<port> to listen on for HTTPS clients")
 	backendAddr := flag.String("backend-addr", "", "the https url of the backend")
 	backendCA := flag.String("backend-ca", "", "the file path to the backend CA bundle")
+	backendCert := flag.String("backend-cert", "", "the file path to the backend client cert")
+	backendKey := flag.String("backend-key", "", "the file path to the backend client key")
 	serverCert := flag.String("server-cert", "", "the file path to the server certificate")
 	serverKey := flag.String("server-key", "", "the file path to the server key")
 	serverCA := flag.String("server-ca", "", "the file path to the server CA")
-	validatorScript := flag.String("validator-script", "", "the file path to the certificate validation script")
+	userHeader := flag.String("user-header", "X-Remote-User", "the header name to pass user info, defaults to X-Remote-User")
+	groupHeader := flag.String("group-header", "X-Remote-Group", "the header name to pass group info, defaults to X-Remote-User")
+	extraHeader := flag.String("extra-header", "X-Remote-Extra-", "the header name prefix to pass extra info, defaults to X-Remote-Extra-")
+	fileMapPath := flag.String("map-file", "", "map based on a file that maps certificates to userinfo")
+	scriptMapPath := flag.String("map-script", "", "map based on the passed script that maps certificates to userinfo")
+	sanMapEnable := flag.Bool("map-san", true, "map based on the certificate subjectAltName OtherName extension")
 	flag.Parse()
 
-	if *listenAddr == "" || *backendAddr == "" || *backendCA == "" || *serverCert == "" || *serverKey == "" || *validatorScript == "" {
-		flag.PrintDefaults()
+	opts := &CertProxyOptions{
+		listenAddr:        *listenAddr,
+		backendAddr:       *backendAddr,
+		backendCA:         *backendCA,
+		backendClientCert: *backendCert,
+		backendClientKey:  *backendKey,
+		proxyServingCert:  *serverCert,
+		proxyServingKey:   *serverKey,
+		proxyServingCA:    *serverCA,
+		userHeader:        *userHeader,
+		groupHeader:       *groupHeader,
+		extraHeader:       *extraHeader,
+		fileMapPath:       *fileMapPath,
+		scriptMapPath:     *scriptMapPath,
+		sanMapEnable:      *sanMapEnable,
+	}
+
+	err := opts.ValidateOptions()
+	if err != nil {
+		log.Printf("%s\n", err)
+		os.Exit(1)
+	}
+	err = opts.SetMappers()
+	if err != nil {
+		log.Printf("%s\n", err)
 		os.Exit(1)
 	}
 
-	opts := &Options{
-		listenAddr:      *listenAddr,
-		backendAddr:     *backendAddr,
-		backendCA:       *backendCA,
-		serverCert:      *serverCert,
-		serverKey:       *serverKey,
-		serverCA:        *serverCA,
-		validatorScript: *validatorScript,
-	}
 	RunCertProxy(opts)
 }
 
